@@ -1,0 +1,16 @@
+{
+  "name": "x-open-reader",
+  "version": "1.0.0",
+  "description": "Republish X posts/threads at AI-readable URLs via rettiwt-api",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^5.2.1",
+    "rettiwt-api": "^7.1.2"
+  }
+}

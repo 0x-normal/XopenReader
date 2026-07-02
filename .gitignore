@@ -1,0 +1,4 @@
+node_modules
+data/*.json
+cookies.json
+.env
