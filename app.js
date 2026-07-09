@@ -1,24 +1,20 @@
 /**
  * X Open Reader
- * Paste an X post or article link -> pulls it via rettiwt-api / GraphQL -> serves it as a clean,
+ * Paste an X post link -> pulls it via rettiwt-api -> serves it as a clean,
  * server-rendered page any AI agent can fetch without authentication.
  *
  * Endpoints:
  *   GET  /                     UI (paste link, get share links)
- *   POST /api/fetch            { url, thread: bool } -> fetches + caches (posts & articles)
- *   GET  /t/:id                Human/AI readable HTML for posts (no JS required to read)
+ *   POST /api/fetch            { url, thread: bool } -> fetches + caches
+ *   GET  /t/:id                Human/AI readable HTML (no JS required to read)
  *   GET  /t/:id.md             Markdown (best for AI agents)
  *   GET  /t/:id.txt            Plain text
  *   GET  /t/:id.json           Raw structured JSON
- *   GET  /a/:id                Human/AI readable HTML for articles
- *   GET  /a/:id.md             Article in Markdown
- *   GET  /a/:id.txt            Article in plain text
- *   GET  /a/:id.json           Article structured JSON
  *
  * Env:
  *   RETTIWT_API_KEY   rettiwt API key (base64 cookie string). Optional:
  *                     without it, guest mode is used (single posts usually
- *                     work; thread expansion and articles need auth).
+ *                     work; thread expansion needs auth).
  *   PORT              default 3000
  *   BASE_URL          public base URL used in generated share links,
  *                     e.g. https://reader.yourdomain.com (default: request host)
@@ -27,7 +23,6 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
 
 const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
 const DATA_DIR = IS_SERVERLESS ? '/tmp/x-reader' : path.join(__dirname, 'data');
@@ -42,6 +37,9 @@ const pool = new CookiePool();
 const AUTHED = pool.authed;
 console.log(`[pool] loaded ${pool.size} cookie(s)${AUTHED ? '' : ' — guest mode'}`);
 
+const article = require('./article');
+article.registerResources();
+
 
 const app = express();
 app.use(express.json());
@@ -54,330 +52,6 @@ function extractId(input) {
   if (/^\d{5,25}$/.test(s)) return s;
   const m = s.match(/(?:twitter\.com|x\.com)\/[^/]+\/status(?:es)?\/(\d+)/i);
   return m ? m[1] : null;
-}
-
-function extractArticleId(input) {
-  if (!input) return null;
-  const s = String(input).trim();
-  const m = s.match(/(?:twitter\.com|x\.com)\/i\/article\/(\d+)/i);
-  return m ? m[1] : null;
-}
-
-function isArticleUrl(input) {
-  if (!input) return false;
-  return /(?:twitter\.com|x\.com)\/i\/article\/\d+/i.test(String(input).trim());
-}
-
-/* ------------- Article fetcher (direct GraphQL) ------------- */
-
-const X_BEARER = 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
-
-/** Decode a base64 rettiwt api key back into cookie string, or use raw cookie string */
-function keyToCookieStr(slot) {
-  if (!slot || !slot.key) return null;
-  const key = slot.key;
-  try {
-    const decoded = Buffer.from(key, 'base64').toString('utf8');
-    // if it looks like a cookie string, return it
-    if (decoded.includes('auth_token=') || decoded.includes('ct0=')) return decoded;
-  } catch {}
-  // If key itself is a raw cookie string
-  if (key.includes('auth_token=') || key.includes('ct0=')) return key;
-  return null;
-}
-
-/** Parse a cookie string into an object */
-function parseCookies(cookieStr) {
-  const cookies = {};
-  if (!cookieStr) return cookies;
-  cookieStr.split(';').forEach((pair) => {
-    const [k, ...v] = pair.trim().split('=');
-    if (k) cookies[k.trim()] = v.join('=').trim();
-  });
-  return cookies;
-}
-
-/** Fetch an article via X's internal GraphQL endpoint */
-async function fetchArticleGraphQL(articleId, cookieStr) {
-  const cookies = parseCookies(cookieStr);
-  const ct0 = cookies.ct0;
-  if (!ct0) throw new Error('Cookie missing ct0 token, cannot fetch article');
-
-  const variables = JSON.stringify({
-    articleId: articleId,
-    withArticleRichContentState: true,
-    withArticlePlainText: true,
-  });
-  const features = JSON.stringify({
-    creator_subscriptions_tweet_preview_api_enabled: true,
-    premium_content_api_read_enabled: true,
-    communities_web_enable_tweet_community_results_fetch: true,
-    c9s_tweet_anatomy_moderator_badge_enabled: true,
-    responsive_web_grok_analyze_button_fetch_trends_enabled: false,
-    responsive_web_grok_analyze_post_followups_enabled: false,
-    responsive_web_grok_share_attachment_enabled: false,
-    articles_preview_enabled: true,
-    responsive_web_edit_tweet_api_enabled: true,
-    graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
-    view_counts_everywhere_api_enabled: true,
-    longform_notetweets_consumption_enabled: true,
-    responsive_web_twitter_article_tweet_consumption_enabled: true,
-    tweet_awards_web_tipping_enabled: false,
-    responsive_web_home_pinned_timelines_enabled: true,
-    longform_notetweets_rich_text_read_enabled: true,
-    longform_notetweets_inline_media_enabled: true,
-    rweb_video_timestamps_enabled: true,
-    responsive_web_graphql_exclude_directive_enabled: true,
-    verified_phone_label_enabled: false,
-    freedom_of_speech_not_reach_fetch_enabled: true,
-    standardized_nudges_misinfo: true,
-    tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
-    responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
-    responsive_web_graphql_timeline_navigation_enabled: true,
-    responsive_web_enhance_cards_enabled: false,
-  });
-
-  const params = new URLSearchParams({ variables, features });
-  const url = `https://x.com/i/api/graphql/6st2IttU9oFnZrTQ71OiYA/ArticleTimeline?${params.toString()}`;
-
-  return new Promise((resolve, reject) => {
-    const options = {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${X_BEARER}`,
-        'Cookie': cookieStr,
-        'X-Csrf-Token': ct0,
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'X-Twitter-Active-User': 'yes',
-        'X-Twitter-Auth-Type': 'OAuth2Session',
-        'X-Twitter-Client-Language': 'en',
-        'Referer': `https://x.com/i/article/${articleId}`,
-      },
-    };
-
-    const req = https.request(url, options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          return reject(new Error(`Article API returned ${res.statusCode}: ${data.slice(0, 300)}`));
-        }
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          reject(new Error('Failed to parse article response'));
-        }
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
-/** Extract readable content from the GraphQL article response */
-function parseArticleResponse(raw, articleId) {
-  // Navigate the nested timeline structure
-  const instructions =
-    raw?.data?.article_timeline_v2?.timeline?.instructions || [];
-
-  let title = '';
-  let coverImageUrl = null;
-  let authorName = null;
-  let authorHandle = null;
-  let createdAt = null;
-  let blocks = [];
-
-  for (const instruction of instructions) {
-    const entries = instruction?.entries || [];
-    for (const entry of entries) {
-      const content = entry?.content;
-      if (!content) continue;
-
-      // Article header entry
-      if (content?.entryType === 'TimelineTimelineItem' || content?.__typename === 'TimelineTimelineItem') {
-        const itemContent = content?.itemContent;
-        if (!itemContent) continue;
-
-        // Article cover/metadata
-        if (itemContent?.article_results || itemContent?.articleResults) {
-          const articleResult = itemContent?.article_results?.result || itemContent?.articleResults?.result;
-          if (articleResult) {
-            title = articleResult.title || title;
-            coverImageUrl = articleResult.cover_image?.media_info?.original_img_url ||
-                           articleResult.cover_image?.url || coverImageUrl;
-            createdAt = articleResult.created_at || createdAt;
-            if (articleResult.author) {
-              authorName = articleResult.author?.name || authorName;
-              authorHandle = articleResult.author?.screen_name || authorHandle;
-            }
-          }
-        }
-
-        // Tweet items within the article
-        const tweetResults = itemContent?.tweet_results?.result;
-        if (tweetResults) {
-          const legacy = tweetResults.legacy || tweetResults.tweet?.legacy;
-          if (legacy?.full_text) {
-            blocks.push({ type: 'tweet', text: legacy.full_text });
-          }
-        }
-      }
-
-      // Module entries (grouped content)
-      if (content?.entryType === 'TimelineTimelineModule' || content?.__typename === 'TimelineTimelineModule') {
-        const items = content?.items || [];
-        for (const item of items) {
-          const ic = item?.item?.itemContent;
-          if (!ic) continue;
-          const tr = ic?.tweet_results?.result;
-          if (tr) {
-            const legacy = tr.legacy || tr.tweet?.legacy;
-            if (legacy?.full_text) {
-              blocks.push({ type: 'tweet', text: legacy.full_text });
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Also try to extract plain text / rich content from the response
-  const articleData = raw?.data?.article_timeline_v2?.article ||
-                     raw?.data?.articleResult?.result ||
-                     null;
-  if (articleData) {
-    title = articleData.title || title;
-    coverImageUrl = articleData.cover_image?.media_info?.original_img_url || coverImageUrl;
-    createdAt = articleData.created_at || createdAt;
-    if (articleData.author) {
-      authorName = articleData.author?.name || authorName;
-      authorHandle = articleData.author?.screen_name || authorHandle;
-    }
-    // Plain text content
-    if (articleData.plain_text) {
-      blocks = [{ type: 'text', text: articleData.plain_text }];
-    }
-    // Rich content (array of content blocks)
-    if (articleData.rich_content_state) {
-      try {
-        const rich = typeof articleData.rich_content_state === 'string'
-          ? JSON.parse(articleData.rich_content_state)
-          : articleData.rich_content_state;
-        if (rich.blocks && Array.isArray(rich.blocks)) {
-          blocks = rich.blocks.map((b) => ({
-            type: b.type || 'text',
-            text: b.text || '',
-            inlineStyles: b.inlineStyleRanges || [],
-            entityRanges: b.entityRanges || [],
-          }));
-        }
-      } catch {}
-    }
-  }
-
-  // Deeply search for article content in any nested structure
-  if (blocks.length === 0) {
-    const deepSearch = (obj, depth = 0) => {
-      if (!obj || depth > 8) return;
-      if (typeof obj !== 'object') return;
-      if (obj.plain_text && !title) {
-        blocks = [{ type: 'text', text: obj.plain_text }];
-      }
-      if (obj.title && !title) title = obj.title;
-      if (obj.rich_content_state && blocks.length === 0) {
-        try {
-          const rich = typeof obj.rich_content_state === 'string'
-            ? JSON.parse(obj.rich_content_state)
-            : obj.rich_content_state;
-          if (rich.blocks && Array.isArray(rich.blocks)) {
-            blocks = rich.blocks.map((b) => ({
-              type: b.type || 'text',
-              text: b.text || '',
-            }));
-          }
-        } catch {}
-      }
-      if (obj.name && !authorName) authorName = obj.name;
-      if (obj.screen_name && !authorHandle) authorHandle = obj.screen_name;
-      for (const key of Object.keys(obj)) {
-        if (key === 'plain_text' || key === 'title') continue;
-        if (typeof obj[key] === 'object' && obj[key] !== null) {
-          deepSearch(obj[key], depth + 1);
-          if (blocks.length > 0 && title) return;
-        }
-      }
-    };
-    deepSearch(raw);
-  }
-
-  return {
-    kind: 'article',
-    id: articleId,
-    requestedId: articleId,
-    title: title || 'Untitled Article',
-    coverImage: coverImageUrl,
-    author: {
-      userName: authorHandle || null,
-      fullName: authorName || null,
-      followers: null,
-    },
-    createdAt: createdAt || null,
-    fetchedAt: new Date().toISOString(),
-    count: blocks.length,
-    warning: blocks.length === 0 ? 'Could not extract article content — the response structure may have changed' : null,
-    blocks,
-    // Store raw for debugging (don't serve this publicly)
-    _raw: raw,
-  };
-}
-
-async function fetchArticle(articleId) {
-  // Try each slot in the pool until one works
-  const slots = pool.slots.filter((s) => !s.guest && !s.dead);
-  if (slots.length === 0) throw new Error('Article fetching requires authenticated cookies — no valid cookies available');
-
-  let lastErr = new Error('No usable cookies');
-  for (const slot of slots) {
-    const cookieStr = keyToCookieStr(slot);
-    if (!cookieStr) continue;
-    try {
-      const raw = await fetchArticleGraphQL(articleId, cookieStr);
-      const parsed = parseArticleResponse(raw, articleId);
-      // Cache it
-      MEM_CACHE.set(`article:${articleId}`, parsed);
-      try {
-        const cacheData = { ...parsed };
-        delete cacheData._raw;
-        fs.writeFileSync(path.join(DATA_DIR, `article_${articleId}.json`), JSON.stringify(cacheData, null, 2));
-      } catch {}
-      return parsed;
-    } catch (e) {
-      lastErr = e;
-      if (/429|rate/i.test(e.message)) continue;
-      if (/401|403/i.test(e.message)) continue;
-      throw e;
-    }
-  }
-  throw lastErr;
-}
-
-function loadArticle(articleId) {
-  const mem = MEM_CACHE.get(`article:${articleId}`);
-  if (mem) return mem;
-  try {
-    const f = path.join(DATA_DIR, `article_${articleId}.json`);
-    if (!fs.existsSync(f)) return null;
-    return JSON.parse(fs.readFileSync(f, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-async function getArticle(articleId) {
-  const cached = loadArticle(articleId);
-  if (cached) return cached;
-  return await fetchArticle(articleId);
 }
 
 function normalize(t) {
@@ -540,6 +214,45 @@ async function getRecord(id, thread) {
   }
 }
 
+/* ---------------- article cache helpers ---------------- */
+
+function persist(record, aliases = []) {
+  MEM_CACHE.set(record.id, record);
+  for (const alias of aliases) {
+    if (alias && alias !== record.id) MEM_CACHE.set(alias, { alias: record.id });
+  }
+  try {
+    fs.writeFileSync(path.join(DATA_DIR, `${record.id}.json`), JSON.stringify(record, null, 2));
+    for (const alias of aliases) {
+      if (alias && alias !== record.id) {
+        fs.writeFileSync(path.join(DATA_DIR, `${alias}.json`), JSON.stringify({ alias: record.id }, null, 2));
+      }
+    }
+  } catch { /* serverless disk may be unavailable; memory cache still works */ }
+}
+
+/** Fetch (or serve cached) an article from an extractArticle() ref. */
+async function getArticleRecord(ref) {
+  const cached = loadRecord(ref.id);
+  if (cached && cached.kind === 'article') return cached;
+  const rec = await article.fetchArticle(pool, ref);
+  persist(rec, [ref.id, rec.entityId, rec.requestedId]);
+  return rec;
+}
+
+/** Serve a cached article by its canonical id, or fetch it as a seed tweet on cold start. */
+async function getArticleById(id) {
+  const cached = loadRecord(id);
+  if (cached && cached.kind === 'article') return cached;
+  try {
+    const rec = await article.fetchArticle(pool, { id, isEntity: false });
+    persist(rec, [id, rec.entityId, rec.requestedId]);
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
 function baseUrl(req) {
   return process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
 }
@@ -548,124 +261,6 @@ const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 /* ---------------- renderers ---------------- */
-
-function articleToMarkdown(rec) {
-  const lines = [];
-  lines.push(`# ${rec.title}`);
-  lines.push('');
-  if (rec.author.fullName || rec.author.userName) {
-    lines.push(`By ${rec.author.fullName || ''}${rec.author.userName ? ` (@${rec.author.userName})` : ''}`);
-    lines.push('');
-  }
-  lines.push(`- Source: https://x.com/i/article/${rec.id}`);
-  lines.push(`- Fetched: ${rec.fetchedAt}`);
-  if (rec.createdAt) lines.push(`- Published: ${rec.createdAt}`);
-  if (rec.warning) lines.push(`- Note: ${rec.warning}`);
-  lines.push('');
-  if (rec.coverImage) {
-    lines.push(`![Cover](${rec.coverImage})`);
-    lines.push('');
-  }
-  lines.push('---');
-  lines.push('');
-  for (const block of rec.blocks) {
-    if (block.type === 'header-one' || block.type === 'header-two' || block.type === 'header-three') {
-      const level = block.type === 'header-one' ? '##' : block.type === 'header-two' ? '###' : '####';
-      lines.push(`${level} ${block.text}`);
-    } else if (block.type === 'blockquote') {
-      block.text.split('\n').forEach((l) => lines.push(`> ${l}`));
-    } else if (block.type === 'unordered-list-item') {
-      lines.push(`- ${block.text}`);
-    } else if (block.type === 'ordered-list-item') {
-      lines.push(`1. ${block.text}`);
-    } else if (block.type === 'code-block') {
-      lines.push('```');
-      lines.push(block.text);
-      lines.push('```');
-    } else if (block.type === 'tweet') {
-      lines.push(`> 🐦 ${block.text}`);
-    } else {
-      lines.push(block.text);
-    }
-    lines.push('');
-  }
-  return lines.join('\n');
-}
-
-function articleToText(rec) {
-  const lines = [];
-  lines.push(rec.title);
-  lines.push('='.repeat(rec.title.length));
-  if (rec.author.fullName || rec.author.userName) {
-    lines.push(`By ${rec.author.fullName || ''}${rec.author.userName ? ` (@${rec.author.userName})` : ''}`);
-  }
-  lines.push('');
-  for (const block of rec.blocks) {
-    lines.push(block.text);
-    lines.push('');
-  }
-  return lines.join('\n');
-}
-
-function articleToHtml(rec, req) {
-  const b = baseUrl(req);
-  const contentBlocks = rec.blocks.map((block) => {
-    if (block.type === 'header-one') return `<h2>${esc(block.text)}</h2>`;
-    if (block.type === 'header-two') return `<h3>${esc(block.text)}</h3>`;
-    if (block.type === 'header-three') return `<h4>${esc(block.text)}</h4>`;
-    if (block.type === 'blockquote') return `<blockquote>${esc(block.text)}</blockquote>`;
-    if (block.type === 'unordered-list-item') return `<ul><li>${esc(block.text)}</li></ul>`;
-    if (block.type === 'ordered-list-item') return `<ol><li>${esc(block.text)}</li></ol>`;
-    if (block.type === 'code-block') return `<pre><code>${esc(block.text)}</code></pre>`;
-    if (block.type === 'tweet') return `<blockquote class="tweet-embed">🐦 ${esc(block.text)}</blockquote>`;
-    return `<p class="body">${esc(block.text).replace(/\n/g, '<br>')}</p>`;
-  }).join('\n');
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(rec.title)} — X Open Reader</title>
-<meta name="description" content="${esc((rec.blocks[0]?.text || '').slice(0, 150))}">
-<style>
-  :root{--ink:#17233b;--dim:#5b6478;--paper:#f6f5f1;--card:#fffdf8;--line:#d8d4c8;--acc:#0e5e4a}
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.65 Georgia,'Times New Roman',serif}
-  .wrap{max-width:680px;margin:0 auto;padding:40px 20px 80px}
-  header.top{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);border-bottom:2px solid var(--ink);padding-bottom:10px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px}
-  h1{font-size:26px;margin:22px 0 6px;line-height:1.3}
-  .meta{color:var(--dim);font-family:ui-monospace,Menlo,monospace;font-size:13px;margin-bottom:20px}
-  .cover{width:100%;max-height:360px;object-fit:cover;border-radius:4px;margin:16px 0}
-  .content{margin-top:24px}
-  .content p{margin:0 0 16px;font-size:17px}
-  .content h2,.content h3,.content h4{margin:28px 0 10px}
-  .content blockquote{margin:14px 0;padding:10px 14px;border-left:3px solid var(--line);color:var(--dim);font-size:15px}
-  .content .tweet-embed{border-left-color:var(--acc);background:var(--card);padding:14px;font-size:15px}
-  .content pre{background:var(--card);border:1px solid var(--line);padding:14px;overflow-x:auto;font-size:13px}
-  .content ul,.content ol{margin:0 0 16px;padding-left:24px}
-  .fmt{margin-top:30px;font-family:ui-monospace,monospace;font-size:13px}
-  .fmt a{color:var(--acc);margin-right:14px}
-  a{color:var(--acc)}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header class="top"><span>X OPEN READER</span><span>article · fetched ${esc(rec.fetchedAt.slice(0, 10))}</span></header>
-  <h1>${esc(rec.title)}</h1>
-  <div class="meta">${rec.author.fullName ? esc(rec.author.fullName) : ''}${rec.author.userName ? ` @${esc(rec.author.userName)}` : ''}${rec.createdAt ? ` · ${esc(rec.createdAt)}` : ''} · <a href="https://x.com/i/article/${esc(rec.id)}">original on X</a></div>
-  ${rec.coverImage ? `<img class="cover" src="${esc(rec.coverImage)}" alt="Cover">` : ''}
-  ${rec.warning ? `<p style="color:#8a5300;font-size:14px">⚠ ${esc(rec.warning)}</p>` : ''}
-  <div class="content">${contentBlocks}</div>
-  <div class="fmt">machine formats:
-    <a href="${b}/a/${rec.id}.md">markdown</a>
-    <a href="${b}/a/${rec.id}.txt">plain text</a>
-    <a href="${b}/a/${rec.id}.json">json</a>
-  </div>
-</div>
-</body>
-</html>`;
-}
 
 function toMarkdown(rec) {
   const lines = [];
@@ -778,13 +373,10 @@ function toHtml(rec, req) {
 
 app.post('/api/fetch', async (req, res) => {
   try {
-    const url = req.body?.url;
-
-    // Check if it's an article URL
-    if (isArticleUrl(url)) {
-      const articleId = extractArticleId(url);
-      if (!articleId) return res.status(400).json({ error: 'Could not find an article ID in that link.' });
-      const rec = await fetchArticle(articleId);
+    // Articles first: /i/article/:id or /:user/article/:id
+    const artRef = article.extractArticle(req.body?.url);
+    if (artRef) {
+      const rec = await getArticleRecord(artRef);
       const b = baseUrl(req);
       return res.json({
         ok: true,
@@ -792,7 +384,7 @@ app.post('/api/fetch', async (req, res) => {
         title: rec.title,
         author: rec.author,
         warning: rec.warning,
-        preview: (rec.blocks[0]?.text || '').slice(0, 240),
+        preview: (rec.previewText || rec.plainText || '').slice(0, 240),
         links: {
           page: `${b}/a/${rec.id}`,
           markdown: `${b}/a/${rec.id}.md`,
@@ -802,8 +394,8 @@ app.post('/api/fetch', async (req, res) => {
       });
     }
 
-    const id = extractId(url);
-    if (!id) return res.status(400).json({ error: 'Could not find a post ID in that link.' });
+    const id = extractId(req.body?.url);
+    if (!id) return res.status(400).json({ error: 'Could not find a post or article ID in that link.' });
     const isThread = Boolean(req.body?.thread);
     const rec = await fetchPost(id, isThread);
     const b = baseUrl(req);
@@ -829,6 +421,28 @@ app.post('/api/fetch', async (req, res) => {
 
 const wantsThread = (req) => req.query.thread === '1' || req.query.thread === 'true';
 
+// ---- article routes (order matters: extension routes before the bare :id route) ----
+app.get('/a/:id.md', async (req, res) => {
+  const rec = await getArticleById(req.params.id);
+  if (!rec) return res.status(404).type('text/plain').send('Article not found or could not be fetched.');
+  res.type('text/markdown; charset=utf-8').send(article.toMarkdown(rec));
+});
+app.get('/a/:id.txt', async (req, res) => {
+  const rec = await getArticleById(req.params.id);
+  if (!rec) return res.status(404).type('text/plain').send('Article not found or could not be fetched.');
+  res.type('text/plain; charset=utf-8').send(article.toText(rec));
+});
+app.get('/a/:id.json', async (req, res) => {
+  const rec = await getArticleById(req.params.id);
+  if (!rec) return res.status(404).json({ error: 'Article not found or could not be fetched.' });
+  res.json(rec);
+});
+app.get('/a/:id', async (req, res) => {
+  const rec = await getArticleById(req.params.id);
+  if (!rec) return res.status(404).type('text/plain').send('Article not found or could not be fetched.');
+  res.type('html').send(article.toHtml(rec, baseUrl(req)));
+});
+
 // order matters: extension routes before the bare :id route
 app.get('/t/:id.md', async (req, res) => {
   const rec = await getRecord(req.params.id, wantsThread(req));
@@ -851,57 +465,10 @@ app.get('/t/:id', async (req, res) => {
   res.type('html').send(toHtml(rec, req));
 });
 
-/* ------------- Article routes ------------- */
-app.get('/a/:id.md', async (req, res) => {
-  try {
-    const rec = await getArticle(req.params.id);
-    if (!rec) return res.status(404).type('text/plain').send('Article not found or could not be fetched.');
-    res.type('text/markdown; charset=utf-8').send(articleToMarkdown(rec));
-  } catch (e) {
-    res.status(502).type('text/plain').send(e.message);
-  }
-});
-app.get('/a/:id.txt', async (req, res) => {
-  try {
-    const rec = await getArticle(req.params.id);
-    if (!rec) return res.status(404).type('text/plain').send('Article not found or could not be fetched.');
-    res.type('text/plain; charset=utf-8').send(articleToText(rec));
-  } catch (e) {
-    res.status(502).type('text/plain').send(e.message);
-  }
-});
-app.get('/a/:id.json', async (req, res) => {
-  try {
-    const rec = await getArticle(req.params.id);
-    if (!rec) return res.status(404).json({ error: 'Article not found or could not be fetched.' });
-    const { _raw, ...clean } = rec;
-    res.json(clean);
-  } catch (e) {
-    res.status(502).json({ error: e.message });
-  }
-});
-app.get('/a/:id', async (req, res) => {
-  try {
-    const rec = await getArticle(req.params.id);
-    if (!rec) return res.status(404).type('text/plain').send('Article not found and could not be fetched.');
-    res.type('html').send(articleToHtml(rec, req));
-  } catch (e) {
-    res.status(502).type('text/plain').send(e.message);
-  }
-});
-
 // convenience: /read?url=<x link>&thread=1 -> redirects to the page
 app.get('/read', async (req, res) => {
   try {
-    const url = req.query.url;
-    // Check if it's an article URL
-    if (isArticleUrl(url)) {
-      const articleId = extractArticleId(url);
-      if (!articleId) return res.status(400).type('text/plain').send('Bad article URL');
-      const rec = await fetchArticle(articleId);
-      return res.redirect(`/a/${rec.id}`);
-    }
-    const id = extractId(url);
+    const id = extractId(req.query.url);
     if (!id) return res.status(400).type('text/plain').send('Bad or missing ?url=');
     const rec = await fetchPost(id, req.query.thread === '1' || req.query.thread === 'true');
     res.redirect(`/t/${rec.id}`);
@@ -956,11 +523,11 @@ const HOME_HTML = `<!doctype html>
 <body>
 <div class="wrap">
   <div class="masthead"><span>X OPEN READER</span><span>off the wire, for machines</span></div>
-  <h1>Make any X post readable by any AI.</h1>
-  <p class="sub">Paste a post or article link. It gets pulled, cached, and republished at a clean URL that agents can fetch without login — in HTML, Markdown, plain text, or JSON.</p>
+  <h1>Make any X post or article readable by any AI.</h1>
+  <p class="sub">Paste a post or Article link. It gets pulled, cached, and republished at a clean URL that agents can fetch without login — in HTML, Markdown, plain text, or JSON.</p>
 
   <div class="row">
-    <input type="text" id="url" placeholder="https://x.com/user/status/1234... or https://x.com/i/article/1234..." autofocus>
+    <input type="text" id="url" placeholder="https://x.com/user/status/1234...  or  /i/article/1234..." autofocus>
     <button id="go">Pull</button>
   </div>
   <div class="opt">
@@ -983,7 +550,8 @@ async function pull(){
     const d = await r.json();
     if(!r.ok) throw new Error(d.error || 'Fetch failed');
     out.innerHTML = '<div class="card">'
-      + '<p class="preview">' + escapeHtml(d.preview) + (d.kind==='thread' ? '\\n\\n[' + d.count + '-post thread]' : d.kind==='article' ? '\\n\\n[Article: ' + escapeHtml(d.title||'') + ']' : '') + '</p>'
+      + (d.kind==='article' && d.title ? '<p style="font-weight:bold;font-size:17px;margin:0 0 8px">' + escapeHtml(d.title) + '</p>' : '')
+      + '<p class="preview">' + escapeHtml(d.preview) + (d.kind==='thread' ? '\\n\\n[' + d.count + '-post thread]' : (d.kind==='article' ? '\\n\\n[X Article]' : '')) + '</p>'
       + (d.warning ? '<p style="color:#8a5300;font-size:13px">⚠ ' + escapeHtml(d.warning) + '</p>' : '')
       + '<div class="links">'
       + '<a href="'+d.links.page+'" target="_blank">'+d.links.page+'</a>'
@@ -996,7 +564,7 @@ async function pull(){
   }catch(e){
     out.innerHTML = '<div class="card err">' + escapeHtml(e.message) + '</div>';
   }finally{
-    btn.disabled = false; btn.textContent = 'Pull';
+    btn.disabled = false; btn.textContent = 'Pull post';
   }
 }
 function escapeHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}

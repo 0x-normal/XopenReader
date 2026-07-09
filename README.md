@@ -2,9 +2,11 @@
 
 Paste an X post link → pulls it via `rettiwt-api` → republishes it at a clean URL that **any AI agent can read without authentication** (X itself blocks all bots via robots.txt + login walls).
 
-Supports single posts **and full threads** (walks the reply chain up AND down from whichever post you link, so mid-thread links work).
+Supports single posts, **full threads** (walks the reply chain up AND down from whichever post you link, so mid-thread links work), and **X Articles** (long-form posts).
 
 ## Endpoints
+
+### Posts & threads
 
 | URL | What it serves |
 |---|---|
@@ -15,7 +17,25 @@ Supports single posts **and full threads** (walks the reply chain up AND down fr
 | `/t/:id.json` | Full structured data (stats, media, quoted posts) |
 | `/read?url=<x link>&thread=1` | One-shot fetch + redirect (bookmarklet-friendly) |
 
+### Articles
+
+Paste either article link form and it resolves automatically:
+`https://x.com/i/article/:id` (redirect/entity link) or `https://x.com/:user/article/:id`.
+
+| URL | What it serves |
+|---|---|
+| `/a/:id` | Clean server-rendered article HTML (headings, lists, quotes, images) |
+| `/a/:id.md` | **Markdown — full article body, best for AI agents** |
+| `/a/:id.txt` | Plain text |
+| `/a/:id.json` | Structured data (title, author, cover, published date, parsed blocks, plain text) |
+
+`:id` in the article routes is the article's **seed post id** (the canonical id returned by `/api/fetch`).
+
 Everything fetched is cached in `data/` as JSON, so share links keep working even if the post is later deleted or your cookie dies.
+
+### How article fetching works
+
+`rettiwt-api` has no article support, so `article.js` reuses its authenticated request pipeline (cookies, CSRF, transaction id, proxy, retries) by registering custom GraphQL resources. An `/i/article/:id` link is an entity/redirect id: it's resolved via `ArticleRedirectScreenQuery` to a seed post, whose `article` field carries the body as a Draft.js content state that gets converted to Markdown/text/HTML.
 
 ## Deploy on Vercel (no VPS needed)
 
