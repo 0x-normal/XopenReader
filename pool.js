@@ -153,7 +153,8 @@ class CookiePool {
         return await fn(client);
       } catch (e) {
         lastErr = e;
-        if (statusOf(e)) {
+        // only auth/rate failures are the cookie's fault; a 404 or 5xx would fail on every cookie
+        if ([401, 403, 429].includes(statusOf(e))) {
           this.penalize(slot.idx, e);
           continue; // rotate to next cookie
         }

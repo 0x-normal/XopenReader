@@ -136,8 +136,23 @@ async function walkDown(tweet) {
   return chain;
 }
 
-async function fetchPost(id, asThread) {
-  const main = await getDetails(id);
+/**
+ * A /status/ link to an X Article is a post whose only content is a t.co link to
+ * /i/article/{entityId}. Returns the extractArticle() ref for that link, or null.
+ */
+function articleRefOfPost(t) {
+  const urls = t?.entities?.urls || [];
+  const leftover = String(t?.fullText || '').replace(/https?:\/\/t\.co\/\S+/g, '').trim();
+  if (leftover) return null;
+  for (const u of urls) {
+    const ref = article.extractArticle(u);
+    if (ref) return ref;
+  }
+  return null;
+}
+
+async function fetchPost(id, asThread, prefetched) {
+  const main = prefetched || (await getDetails(id));
   let posts = [normalize(main)];
   let warning = null;
 
@@ -371,33 +386,50 @@ function toHtml(rec, req) {
 
 /* ---------------- routes ---------------- */
 
+function articleResponse(rec, req) {
+  const b = baseUrl(req);
+  return {
+    ok: true,
+    kind: 'article',
+    title: rec.title,
+    author: rec.author,
+    warning: rec.warning,
+    preview: (rec.previewText || rec.plainText || '').slice(0, 240),
+    links: {
+      page: `${b}/a/${rec.id}`,
+      markdown: `${b}/a/${rec.id}.md`,
+      text: `${b}/a/${rec.id}.txt`,
+      json: `${b}/a/${rec.id}.json`,
+    },
+  };
+}
+
 app.post('/api/fetch', async (req, res) => {
   try {
     // Articles first: /i/article/:id or /:user/article/:id
     const artRef = article.extractArticle(req.body?.url);
-    if (artRef) {
-      const rec = await getArticleRecord(artRef);
-      const b = baseUrl(req);
-      return res.json({
-        ok: true,
-        kind: 'article',
-        title: rec.title,
-        author: rec.author,
-        warning: rec.warning,
-        preview: (rec.previewText || rec.plainText || '').slice(0, 240),
-        links: {
-          page: `${b}/a/${rec.id}`,
-          markdown: `${b}/a/${rec.id}.md`,
-          text: `${b}/a/${rec.id}.txt`,
-          json: `${b}/a/${rec.id}.json`,
-        },
-      });
-    }
+    if (artRef) return res.json(articleResponse(await getArticleRecord(artRef), req));
 
     const id = extractId(req.body?.url);
     if (!id) return res.status(400).json({ error: 'Could not find a post or article ID in that link.' });
     const isThread = Boolean(req.body?.thread);
-    const rec = await fetchPost(id, isThread);
+    const main = await getDetails(id);
+
+    // /status/ link whose post is just an X Article
+    const linkedRef = articleRefOfPost(main);
+    if (linkedRef) {
+      let rec;
+      try {
+        // the post is usually the article's own seed post: one request, works in guest mode
+        rec = await getArticleRecord({ id, isEntity: false });
+      } catch {
+        // a post sharing someone else's article: resolve the linked article instead
+        rec = await getArticleRecord(linkedRef);
+      }
+      return res.json(articleResponse(rec, req));
+    }
+
+    const rec = await fetchPost(id, isThread, main);
     const b = baseUrl(req);
     const q = isThread ? '?thread=1' : ''; // keeps share links thread-aware after serverless cold starts
     res.json({
