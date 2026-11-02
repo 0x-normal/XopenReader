@@ -157,6 +157,13 @@ class CookiePool {
           this.penalize(slot.idx, e);
           continue; // rotate to next cookie
         }
+        // rettiwt-api masks every non-HTTP failure as "Unknown error"; in practice that is
+        // x-client-transaction-id failing to parse x.com after an X site change
+        if (e?.message === 'Unknown error') {
+          throw new Error(
+            'rettiwt-api failed before reaching X (likely x-client-transaction-id broke after an X site change) — update rettiwt-api'
+          );
+        }
         throw e; // not-found / network errors: don't burn other cookies
       }
     }

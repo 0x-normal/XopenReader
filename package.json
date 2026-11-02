@@ -11,6 +11,6 @@
   "license": "ISC",
   "dependencies": {
     "express": "^5.2.1",
-    "rettiwt-api": "^7.1.2"
+    "rettiwt-api": "^7.1.5"
   }
 }
