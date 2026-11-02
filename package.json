@@ -12,6 +12,9 @@
   "engines": {
     "node": "22.x"
   },
+  "overrides": {
+    "linkedom": "0.18.12"
+  },
   "dependencies": {
     "express": "^5.2.1",
     "rettiwt-api": "^7.1.5"
